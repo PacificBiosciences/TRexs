@@ -1,0 +1,726 @@
+---
+title: "`trgt` Repeat Expansion Summary for Known Potentially Pathogenic Loci"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    self_contained: true
+params:
+  sample_sheet: ""
+  control_tsv: ""
+  trvz_binary: ""
+  pathogenic_bed: ""
+  hg38: ""
+  repeats_db: ""
+  high_prev_genes: ""
+  show_high_prev_gene: FALSE
+  version: "0.3"
+  odir: "./"
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type="text/css">
+div.main-container {
+max-width: 1200px;
+margin-left: auto;
+margin-right: auto;
+}
+</style>
+
+```{r setup, include=FALSE}
+# Load library
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev='png')
+
+library(tidyverse)
+library(plotly)
+library(ggbeeswarm)
+library(readxl)
+library(pander)
+library(htmlwidgets)
+library(htmltools)
+library(DT)
+library(knitr)
+library(processx)
+library(isotree)
+theme_set(theme_bw(base_size = 14))
+```
+
+```{r load_data, echo=FALSE, include=FALSE}
+# Load all VCFs
+# all_vcf <- dir(params$disease_folder, "*.vcf.gz",
+#                full.names = TRUE)
+# control_vcf <- dir("control_vcf/", "*.vcf.gz",
+#                    full.names = TRUE)
+
+# Load sample sheet
+sample_sheet <- read_tsv(params$sample_sheet,
+                         col_names = c("sample", "vcf_path", "bam_path"),
+                         col_types = c("sample" = "c"))
+
+# Repeat expansion to hide. Default TCF4 and NIPA1 which have very high prevalence
+high_prev_gene <- params$high_prev_genes
+high_prev_gene <- c(str_split(high_prev_gene, pattern = ",", simplify = TRUE))
+# Remove space in case user put space
+high_prev_gene <- str_replace(high_prev_gene, "\\ ", "")
+
+# Function to read VCF file
+read_vcf <- function(ivcf){
+  # Get vcf name
+  vcf_name <- basename(ivcf)
+  vcf_name <- gsub("(.*?)\\.vcf(.gz)*", "\\1", vcf_name)
+  print(paste0("Reading ", vcf_name))
+  # Read headers
+  headers <- c()
+  con <- file(ivcf, "r")
+  while(TRUE){
+    line = readLines(con, 1)
+    # Empty vcf
+    if(identical(line, character(0))) break
+    if(!grepl("^#", line)) break
+    else headers <- c(headers, line)
+  }
+  close(con)
+  format <- headers[grepl('##FORMAT=', headers)]
+  format_id <- gsub(".*ID=(.*?),.*", "\\1", format)
+  vcf <- read_tsv(ivcf, comment = "#",
+                  col_names = c("chr", "start", "end",
+                                "ref", "alt", "QUAL",
+                                "filter", "INFO",
+                                "FORMAT", "values"),
+                  col_types = cols("start" = "i", "chr" = "c",
+                                   "end" = "c", "ref" = "c",
+                                   "alt" = "c", "QUAL" = "i",
+                                   "filter" = "c", "INFO" = "c",
+                                   "FORMAT" = "c", "values" = "c"))
+  vcf <- vcf %>% 
+    separate(values, into=format_id, sep=":") %>% 
+    mutate(vcf_path = ivcf)
+}
+
+disease_repeats <- map_dfr(sample_sheet$vcf_path, read_vcf) %>% 
+  mutate(sample_type = "disease") %>% 
+  inner_join(sample_sheet, by = "vcf_path")
+
+# control_repeats <- map_dfr(control_vcf, read_vcf) %>%
+#   mutate(sample_type = "control")
+# # Replace control name with 1, 2, 3 etc
+# control_snames <- unique(control_repeats$sample)
+# names(control_snames) <- seq(1, length(control_snames))
+# control_repeats <- control_repeats %>%
+#   mutate(sample = factor(control_repeats$sample,
+#                          levels = control_snames,
+#                          labels = paste0("Control Sample ", names(control_snames))))
+# # Save control repeats for packaging
+# write_tsv(x = control_repeats %>% select(-vcf_path), file = "control_samples_repeat.tsv")
+
+# If control repeats already generated, load it directly
+control_repeats <- read_tsv(params$control_tsv,
+                            col_types = cols("start" = "i", "chr" = "c",
+                                   "end" = "c", "ref" = "c",
+                                   "alt" = "c", "QUAL" = "i",
+                                   "filter" = "c", "INFO" = "c",
+                                   "FORMAT" = "c", "AL" = "c",
+                                   "SD" = "c"))
+
+# Disease and control sample number
+disease_num <- disease_repeats$sample %>% unique %>% length
+control_num <- control_repeats$sample %>% unique %>% length
+
+# Load repeats database for pathogenic repeat expansion
+repeats_db <- read_tsv(params$repeats_db)
+
+merge_repeat <- bind_rows(disease_repeats,
+                          control_repeats)
+# Split haplotype length
+merge_repeat <- merge_repeat %>% 
+  mutate(repeat_gene = gsub("TRID=(.*?);.*", "\\1", INFO)) %>% 
+  separate(AL, into=c("AL1", "AL2"), sep = ",") %>% 
+  separate(SD, into=c("SD1", "SD2"), sep = ",") %>% 
+  mutate_at(c("AL1", "AL2",
+              "SD1", "SD2"), as.numeric) %>% 
+  rowwise() %>% 
+  mutate(max_AL = max(c(AL1, AL2))) %>% 
+  ungroup 
+
+# Split INFO tag
+merge_repeat <- merge_repeat %>% 
+  separate(INFO, into=c("TRID", "END", "MOTIFS",
+                        "STRUC"),
+           sep = ";") %>% 
+  mutate_at(c("TRID", "END", "MOTIFS",
+              "STRUC"),
+            function(x) {gsub(".*=(.*)", "\\1", x)})
+
+# Get total motif copy
+count_motif <- function(x){
+  haplotypes <- str_split_fixed(x, ",", 2)
+  h1 <- haplotypes[, 1]
+  h2 <- haplotypes[, 2]
+  h1 <- str_split(h1, "_", simplify = FALSE)
+  # Some MC has ".", suppress warning
+  h1 <- suppressWarnings(lapply(h1, as.numeric))
+  h1 <- sapply(h1, sum, na.rm=TRUE)
+  h2 <- str_split(h2, "_", simplify = FALSE)
+  h2 <- suppressWarnings(lapply(h2, as.numeric))
+  h2 <- sapply(h2, sum, na.rm=TRUE)
+  return(paste0(h1, ",", h2))
+}
+merge_repeat <- merge_repeat %>% 
+  mutate(haplotype_nCopies = count_motif(MC)) %>% 
+  separate(haplotype_nCopies, into=c("h1_nCopies",
+                                     "h2_nCopies"),
+           sep = ",") %>% 
+  mutate_at(c("h1_nCopies",
+              "h2_nCopies"),
+            as.numeric) %>% 
+  rowwise() %>% 
+  mutate(max_copy = max(c(h1_nCopies, h2_nCopies))) %>% 
+  ungroup() %>% 
+  # Potentiall unknown/novel motif
+  mutate(unknown_motif=if_else(grepl("\\.", MS), "Yes", "No"))
+
+# Get all genotyped genes (for sanity check)
+genotyped <- unique(merge_repeat$repeat_gene)
+
+control_repeats_genes <- merge_repeat %>% 
+  filter(sample_type == "control") %>% 
+  pull(repeat_gene) %>% table
+disease_repeats_genes <- merge_repeat %>% 
+  filter(sample_type == "disease") %>% 
+  pull(repeat_gene) %>% table 
+
+merge_repeat$sample_type <- factor(merge_repeat$sample_type, levels = c("control", "disease"))
+# This should be zero since all control genes should be genotyped
+# in disease
+# setdiff(names(control_repeats_genes), names(disease_repeats_genes))
+# This is what is genotyped in disease but not control
+# setdiff(names(disease_repeats_genes), names(control_repeats_genes))
+
+# Mutate repeats db into format for plotting
+repeats_db <- repeats_db %>% 
+  dplyr::rename(repeat_gene = g_symbol) %>% 
+  # Capitalize gene name
+  mutate_at("repeat_gene", toupper)
+# Multiple pathogenic low by repeat length to get total length
+repeats_db <- repeats_db %>% 
+  rowwise() %>% 
+  mutate(rep_length = 
+           if_else(!grepl("/", r_unit), str_length(r_unit),
+                   max(str_length(unlist(str_split(r_unit, "/")))))) %>% 
+  ungroup()
+# Specially handle a few genes
+repeats_db[repeats_db$repeat_gene == "EIF4A3", 'rep_length'] <- 24
+
+repeats_db <- repeats_db %>% 
+  mutate(path_rep_length = rep_length * pathogenic_low)
+
+# SOX3 annotation of 15 copies appear to be way too low?
+repeats_db[repeats_db$repeat_gene == "SOX3", 'pathogenic threshold'] <- 47
+
+# Add annotation to main df
+annotate_rep <- merge_repeat %>% 
+  inner_join(repeats_db, by="repeat_gene")
+
+repeats_db <- repeats_db %>% 
+  mutate(sample_type = 'pathogenic threshold')
+
+# Split into 4 groups to plot
+all_genes <- annotate_rep %>% 
+  pull(repeat_gene) %>%
+  unique() %>% 
+  sort()
+
+# Order genes
+merge_repeat$repeat_gene <- factor(merge_repeat$repeat_gene, levels=all_genes)
+repeats_db$repeat_gene <- factor(repeats_db$repeat_gene, levels=all_genes)
+
+all_genes <- split(all_genes, cut(seq_along(all_genes), 4, labels = FALSE))
+```
+
+* Disclaimer: This tool is designed for research and is not intended for diagnostic purpose.
+* Version of `TRexs`: `r params$version`
+* Number of disease samples: `r merge_repeat %>% filter(sample_type == "disease") %>% pull(sample) %>% unique() %>% length()`
+* Number of control samples: `r merge_repeat %>% filter(sample_type == "control") %>% pull(sample) %>% unique() %>% length()`
+* Number of repeats genotyped: `r merge_repeat %>% select(repeat_gene, MOTIFS) %>% unique %>% nrow`
+<!-- * Genes genotyped but not visualized: `r setdiff(genotyped, unique(repeats_db$repeat_gene))` -->
+
+# Distribution of repeat expansion relative to HPRC controls {.tabset}
+
+* Mouse over each point for detailed sample information,
+* Mouse over color block for disease-related information.
+* Left click to draw rectangle to zoom into any region on the plot.
+* Note that number of copies here are sum of all expanded motifs and are not specific to motifs known to cause disease.
+* By default, normal, premutation and pathogenic thresholds are curated using the `DRED` database as a base. Developer may manually curate and modify the threshold to the best of his/her knowledge.
+* Transparency of the points for diseased cohort corresponds to the `isofor_score` which is
+the method used to detect outlier based on allelic length (regardless of motifs). The higher the score is,
+the rarer the sample's repeats expansion is.
+
+```{r annotate_repeat, echo=FALSE, message=FALSE, fig.height=16, fig.width=12, results="asis"}
+# Which one has repeat higher than pathogenic low?
+# Look at all gene. Text aesthetic will be used by plotly
+# Color outlier to be the same as boxplot
+
+# Use isolation forest to assign outlier score
+iso_score <- function(x){
+  model <- isolation.forest(matrix(x), ndim=1, ntrees=100, nthreads=2)
+  scores <- predict(model, matrix(x), scoring_metric = "adj_depth")
+  return(scores)
+}
+annotate_rep <- annotate_rep %>% 
+  group_by(repeat_gene) %>% 
+  mutate(isofor_score = iso_score(max_AL)) %>% 
+  ungroup()
+
+options(warn=-1)
+update_geom_defaults("point", list(colour = NULL))
+plotly_obj <- list()
+for (i in 1:length(all_genes)){
+  pandoc.header(paste0("Set ", i, " of genes"), level = 2)
+  set_rep <- annotate_rep %>% 
+    filter(sample_type == "control") %>% 
+    filter(repeat_gene %in% all_genes[[i]]) %>% 
+    pull(max_copy)
+  
+  max_y <- max(set_rep, na.rm = TRUE)
+  minimum_y <- min(set_rep, na.rm = TRUE)
+  
+  repeats_seg <- repeats_db %>% 
+    ungroup() %>% 
+    filter(repeat_gene %in% all_genes[[i]]) %>% 
+    select(repeat_gene, contains("normal"), contains("premutation"), 
+           contains("pathogenic"), -contains("r_"),
+           -`pathogenic threshold`, d_name) %>% 
+    arrange(repeat_gene)
+  
+  # Give gene group number
+  repeats_seg$x <- 1
+  count = 1
+  for (j in 2:nrow(repeats_seg)){
+    if (repeats_seg[j,]$repeat_gene != repeats_seg[j-1,]$repeat_gene) {
+      count <- count + 1
+      repeats_seg[j,]$x = count
+    } else{
+      repeats_seg[j,]$x = count
+    }
+  }
+  
+  max_y <- max(max_y, minimum_y)
+  
+  repeats_seg <- repeats_seg %>% 
+    pivot_longer(names_to = "type", values_to = "y", contains(c("low", "high"))) %>% 
+    arrange(repeat_gene, y, type) %>% 
+    # Remove label for normal and premutation
+    mutate(type = gsub("(.*)_.*", "\\1", type),
+           lab_name = if_else(grepl("normal|premutation", type),
+                              "", d_name),
+           lab_copy = if_else(grepl("normal|premutation", type),
+                              "", as.character(y))) %>% 
+    group_by(repeat_gene, type) %>% 
+    summarise(x = unique(x), miny = min(y), w = max(y) - min(y),
+              Pathogenic_threshold = paste(paste0(lab_name, ": ",
+                                                  lab_copy), collapse = "; ")) %>% 
+    ungroup() %>% 
+    mutate(w = if_else(type == "pathogenic", max_y - miny + 10000, w),
+           # Remove empty stuff
+           Pathogenic_threshold = gsub("^: .* : $", "", Pathogenic_threshold)
+    ) %>% 
+    arrange(repeat_gene, x, miny)
+  
+  # Make disease theshold NA so we can fill later
+  repeats_seg$Pathogenic_threshold[repeats_seg$Pathogenic_threshold == ""] <- NA
+  
+  relevant_repeats <- repeats_db %>% 
+    filter(repeat_gene %in% all_genes[[i]])
+  
+  # Annotate repeat
+  repeats_seg <- repeats_seg %>% 
+    left_join(relevant_repeats %>% 
+                select(repeat_gene, d_name, d_inheritance,
+                       pathogenic_motifs),
+              by = "repeat_gene") %>%
+    # Replicate the disease labels
+    group_by(repeat_gene) %>% 
+    fill(Pathogenic_threshold, .direction = "updown") %>% 
+    ungroup %>% 
+    mutate(label = paste0("Gene: ", repeat_gene, "\n", d_name,
+                          "\nKnown inheritance mode: ", d_inheritance,
+                          "\nPathogenic motifs: ", pathogenic_motifs,
+                          "\nPathogenic threshold for disease:\n", Pathogenic_threshold))
+  
+  all_repeat_plot_with_path <- ggplot() + 
+    geom_rect(data = repeats_seg, aes(x = repeat_gene, 
+                                   ymin = miny, ymax = miny+w, fill = type,
+                                   text = label),
+              alpha = 0.3, xmin = repeats_seg$x - 0.5, xmax = repeats_seg$x + 0.5,
+              show.legend = FALSE) +
+    geom_quasirandom(data = annotate_rep %>% 
+                       filter(sample_type == "control") %>% 
+                       filter(repeat_gene %in% all_genes[[i]]),
+                     aes(x = repeat_gene, 
+                         y = max_copy, 
+                         color = sample_type,
+                         text = paste0("Sample: ", sample, 
+                                       "\nGenotyped motifs: ", MOTIFS,
+                                       "\ntrgt MC: ", MC,
+                                       "\nAllelic length: ", AL1, ", ", AL2,
+                                       "\nAllelic confidence interval: ", ALCI,
+                                       "\nAllelic depth: ", SD1, ", ", SD2)),
+                     alpha = 0.35,
+                     stroke = NA) +
+    geom_quasirandom(data = annotate_rep %>% 
+                       filter(sample_type == "disease") %>% 
+                       filter(repeat_gene %in% all_genes[[i]]),
+                     aes(x = repeat_gene, 
+                         y = max_copy, 
+                         color = sample_type,
+                         text = paste0(paste0("Sample: ", sample, 
+                                              "\nGenotyped motifs: ", MOTIFS,
+                                              "\ntrgt MC: ", MC,
+                                              "\nAllelic length: ", AL1, ", ", AL2, 
+                                              "\nAllelic confidence interval: ", ALCI,
+                                              "\nAllelic depth: ", SD1, ", ", SD2)),
+                         alpha = isofor_score),
+                     stroke = NA) +
+    labs(x = "Genes", y = "Maximum haplotype copies for known motifs") +
+    scale_y_continuous(trans=scales::pseudo_log_trans(base = 2),
+                       breaks = c(0, 10, 20, 50, 100, 200, 1000, 2000, 5000, 10000)) +
+    scale_color_manual(
+      name = "Legend",
+      breaks = c("control", "disease", "pathogenic threshold"),
+      values = c("control" = "grey",
+                 "disease" = "#dc1ca0",
+                 "pathogenic threshold" = "#ef8a62")) +
+    scale_fill_manual(values = c("normal" = "#91bfdb",
+                                 "premutation" = "#ffffbf",
+                                 "pathogenic" = "#fc8d59")) +
+    # scale_alpha_manual(values = c("control" = 0.5,
+    #                               "disease" = 0.75)) +
+    guides(alpha = 'none') +
+    theme(legend.position = "bottom", axis.title.y = element_blank()) +
+    coord_flip(ylim = c(minimum_y, max_y + 10))
+  
+  plotly_obj[[i]] <- ggplotly(all_repeat_plot_with_path,
+                              width=800, height=1000) %>% 
+    layout(legend = list(orientation = "h", x = 0, y = -0.2))
+  
+  # Remove weird legend such as (disease, 1) which is not supposed to be range
+  for (j in 1:length(plotly_obj[[i]]$x$data)){
+    if (!is.null(plotly_obj[[i]]$x$data[[j]]$name)){
+      plotly_obj[[i]]$x$data[[j]]$name =  gsub("\\(","",str_split(plotly_obj[[i]]$x$data[[j]]$name,",")[[1]][1])
+    }
+  }
+  
+  # Fix duplicated legend
+  for (j in 2:length(plotly_obj[[i]]$x$data)) {
+    # Handle first element
+    if(j == 2){
+      plotly_obj[[i]]$x$data[[1]]$legendgroup <- plotly_obj[[i]]$x$data[[1]]$name
+      plotly_obj[[i]]$x$data[[1]]$showlegend <- TRUE
+    }
+    # assign group identifier
+    plotly_obj[[i]]$x$data[[j]]$legendgroup <- plotly_obj[[i]]$x$data[[j]]$name
+    # Only show legend for one element in each group
+    if(plotly_obj[[i]]$x$data[[j]]$name != plotly_obj[[i]]$x$data[[j-1]]$name){
+      plotly_obj[[i]]$x$data[[j]]$showlegend <- TRUE
+    } else{
+      plotly_obj[[i]]$x$data[[j]]$showlegend <- FALSE
+    }
+  }
+  
+  # htmlwidgets::saveWidget( plotly_obj[[i]], "temp.html")
+  # print( htmltools::tags$iframe(src="temp.html", width=1200, height=1800))
+  
+  cat("\n")
+  
+  cat(htmltools::renderTags(as_widget(plotly_obj[[i]],
+                                      sizingPolicy = html::sizingPolicy(viewer.suppress = TRUE,
+                                                                        knitr.figure = FALSE,
+                                                                        browser.fill = TRUE,
+                                                                        browser.padding = 75,
+                                                                        knitr.defaultWidth = 800,
+                                                                        knitr.defaultHeight = 1000,
+                                                                        browser.defaultHeight = 1000)))$html)
+  
+  # adding also empty lines, to be sure that this is valid Markdown
+  pander::pandoc.p('')
+  pander::pandoc.p('')
+}
+update_geom_defaults("point", list(colour = "black"))
+options(warn=0)
+```
+
+```{r echo=FALSE, messages=FALSE, warning=FALSE}
+# Attach the Dependencies since they do not get included with renderTags(...)$html
+deps <- lapply(
+  Filter(f = function(x){inherits(x,"htmlwidget")}, x = plotly_obj),
+  function(hw){
+    htmltools::renderTags(hw)$dependencies
+  }
+)
+htmltools::attachDependencies(x = htmltools::tagList(), value = unlist(deps,recursive=FALSE))
+```
+
+# Table of potentially significant repeats
+
+* Curated repeat expansions with high prevalence not shown here: `r high_prev_gene`
+* Top row of table can be used to filter the samples. For example type "Yes" in the column "Pathogenic motif high?" to look for samples with expanded motifs known to cause disease (Note that this will remove samples with novel motifs).
+* You can also use expression like ">10" in numerical columns to filter based on cut-offs.
+* This table is generated based on the following logics:
+  * `MC` tags from `trgt` output is used to get total number of copies on each allele (e.g. "50_50" represent 50 copies for each motif genotyped, and this will sum to 100).
+  * All samples are filtered if maximum number of copies expanded by any motif exceed known pathogenic threshold. This means, if there's 1000 copies of `TAAAA`, we will output this even though it's not the known pathogenic motifs.
+  * For the remaining samples, we further filter based on known inheritance patterns. E.g. in `RFC1` both allele needs to be expanded more than the pathogenic threshold.
+  * However, if known pathogenic motifs are found in sample, it's tested specifically for that motif to produce "Pathogenic motif high?". E.g. in `BEAN1` we test specifically if `TGGAA` has more copies than known threshold.
+  * Finally, if we see >10% or n>=5 control samples have copies more than pathogenic threshold, we check if the disease samples are expanded more than the minimum copies in the group of control samples with high expansion, while considering inheritance pattern similar to above.
+  * If there's more than 10 samples being looked at, we filter out any genes whereby more than half of the samples are expanded in the repeats as 
+    these are likely not disease-causing.
+  * Note that the genotyped motif for some repeats may differ from conventional testing. E.g. `ATXN2` is genotyped with
+  `GCT` instead of the usual `CAG`, so there may be an offset of 1 copy.
+* Outlier score is determined using isolation forest (package `isotree` with a default of n=100 trees).
+
+
+```{r, echo=FALSE}
+# Suppress summarise info
+options(dplyr.summarise.inform = FALSE)
+
+# Annotate if motif fits with repeats
+annotate_rep$`Has pathogenic motif?` <- rep("No", nrow(annotate_rep))
+annotate_rep$`Pathogenic motif high?` <- rep("No", nrow(annotate_rep))
+for (i in 1:nrow(annotate_rep)){
+  row <- annotate_rep[i, ]
+  mc <- str_split_fixed(row$MC, ",", 2)
+  if(grepl(row$pathogenic_motifs, row$MOTIFS)){
+    motif_name <- c(str_split(row$MOTIFS, ",", simplify = TRUE))
+    motif_copies1 <- suppressWarnings(as.numeric(str_split(mc[1], "_", simplify = TRUE)))
+    motif_copies2 <- suppressWarnings(as.numeric(str_split(mc[2], "_", simplify = TRUE)))
+    if(any(is.na(motif_copies1))){
+      total_pat_copies1 <- 0
+    } else {
+      names(motif_copies1) <- motif_name
+      total_pat_copies1 <- sum(motif_copies1[names(motif_copies1) %in% row$pathogenic_motifs], 
+                               na.rm = TRUE)
+    }
+    if(any(is.na(motif_copies2))){
+      total_pat_copies2 <- 0
+    } else {
+      names(motif_copies2) <- motif_name
+      total_pat_copies2 <- sum(motif_copies2[names(motif_copies2) %in% row$pathogenic_motifs], 
+                               na.rm = TRUE)
+    }
+    if (total_pat_copies1 > row$pathogenic_low | 
+        total_pat_copies2 > row$pathogenic_low){
+      annotate_rep[i, 'Pathogenic motif high?'] <- "Yes"
+    }
+    if (total_pat_copies1 > 0 | 
+        total_pat_copies2 > 0){
+      annotate_rep[i, 'Has pathogenic motif?'] <- "Yes"
+    }
+  }
+}
+
+sig_rep <- annotate_rep %>% 
+  filter(max_copy > pathogenic_low) %>% 
+  select(sample, sample_type, repeat_gene, max_copy, pathogenic_low, pathogenic_motifs,
+         d_name, d_name_alias, d_inheritance, `Has pathogenic motif?`, `Pathogenic motif high?`,
+         h1_nCopies, h2_nCopies, isofor_score, ALCI, SD1, SD2, MC, MS, AM, TRID, END, MOTIFS, STRUC) %>% 
+  # If autosomal recessive disease, require both HL to be longer
+  mutate(keep = if_else(grepl("recessive", d_inheritance) & (!grepl("dominant", d_inheritance)), 
+                        if_else(h1_nCopies > pathogenic_low & h2_nCopies > pathogenic_low, "Yes", "No"),
+                        "Yes"),
+         isofor_score = round(isofor_score, 3)) %>% 
+  filter(keep == "Yes") %>% 
+  select(-keep)
+colnames(sig_rep) <- c(
+  "Sample", "Sample type", "Gene", "Max haplotype copies",
+  "Potentially pathogenic threshold copies", "Potentially pathogenic motifs",
+  "Disease name", "Disease alias", "Disease inheritance", "Has pathogenic motif?", "Pathogenic motif high?",
+  "Haplotype 1 copies", "Haplotype 2 copies", "Outlier score",  "Haplotype CI", "Haplotype depth 1", "Haplotype depth 2",
+  "Motif copies", "Motif support", "Motif methylation level", "TRID", "END", "MOTIFS", "STRUC"
+)
+
+# If at least 10% or 5 counts of controls have the disease, don't output those higher than the minimum copy in control cohort
+too_many <- sig_rep %>% filter(`Sample type` == "control") %>% pull(`Disease alias`) %>% table()
+too_many <- too_many[too_many/control_num >= 0.1 | too_many >= 5]
+too_many_min_AL <- sig_rep %>% 
+  filter(`Sample type` == "control",
+         `Disease alias` %in% names(too_many)) %>% 
+  group_by(`Disease alias`, Gene) %>% 
+  summarise(copy_min_control = min(`Max haplotype copies`)) %>% 
+  ungroup()
+sig_rep <- sig_rep %>% 
+  left_join(too_many_min_AL, by=c("Disease alias", "Gene")) %>% 
+  # Use 0 to keep everything that's not in the list above
+  replace_na(list(copy_min_control = 0)) %>% 
+  # handle recessive and dominant separately
+  mutate(
+    keep = if_else(
+      grepl("recessive", `Disease inheritance`) & (!grepl("dominant", `Disease inheritance`)),
+      if_else(`Haplotype 1 copies` > copy_min_control & `Haplotype 2 copies` > copy_min_control, "Yes", "No"),
+      if_else(`Haplotype 1 copies` > copy_min_control | `Haplotype 2 copies` > copy_min_control, "Yes", "No")
+    )
+  ) %>% 
+  filter(keep == "Yes") %>% 
+  select(-keep, -copy_min_control)
+
+# QC number of samples with pathogenic repeat in control and disease
+n_disease <- sig_rep %>% 
+  group_by(`Sample type`, `Disease alias`, `Gene`) %>% 
+  summarise(n_with_disease = n()) %>% 
+  ungroup()
+
+# Output disease only. If more than 50% of disease samples have a disease (In case of n >= 10), don't output!
+if(disease_num >= 10){
+  disease_sig_rep <- sig_rep %>% 
+    filter(`Sample type` == "disease") %>%
+    group_by(`Sample type`, `Disease alias`, `Gene`) %>% 
+    filter(n()/disease_num < 0.5) %>% 
+    ungroup() %>% 
+    select(-`Sample type`)
+} else {
+    disease_sig_rep <- sig_rep %>% 
+    filter(`Sample type` == "disease") %>%
+    select(-`Sample type`)
+}
+
+# To show high prevalence expansion or not (E.g. NIPA1 and TCF4)
+if(params$show_high_prev_gene){
+  params$show_high_prev_gene
+} else {
+  to_show_tab <- disease_sig_rep %>% 
+    filter(!Gene %in% high_prev_gene)
+}
+
+# Change gene name to factor so that we can filter with checkboxes in DT
+to_show_tab$Gene <- factor(to_show_tab$Gene)
+
+# Unselect disease alias to make it cleaner
+datatable(to_show_tab %>% select(-`Disease alias`),
+          options = list(scrollX = TRUE,
+                         search=list(regex=TRUE)), 
+          filter = list(
+            position = 'top', clear = FALSE
+          ))
+options(dplyr.summarise.inform = TRUE)
+write_tsv(disease_sig_rep, file.path(paste0(params$odir, "/potential_pathogenic_repeats.tsv")))
+# Write a list of all samples with unknown motif
+unknown_motif <- annotate_rep %>% 
+  filter(unknown_motif == "Yes", sample_type == "disease") %>% 
+  select(-vcf_path, -bam_path)
+
+write_tsv(unknown_motif, file.path(paste0(params$odir, "/unknown_or_novel_motifs.tsv")))
+
+# Also save a list of those with very confident hits
+to_show_tab %>% 
+  select(-`Disease alias`) %>% 
+  filter(`Haplotype depth 1` > 1, `Haplotype depth 2` > 1, 
+         `Pathogenic motif high?` == "Yes") %>% 
+  write_tsv(file.path(paste0(params$odir, "/high_potential_pathogenic_repeats.tsv")))
+```
+
+# TRVZ Visualization of Potentially Pathogenic Repeats {.tabset .tabset-dropdown}
+* By default, only those with matching pathogenic motifs ("Pathogenic Motif High" column above) will be visualized here.
+```{r trvz_rep_viz, echo=FALSE, out.width = "100%", fig.align = "center", results="asis", dpi=36}
+
+if(!dir.exists(file.path(paste0(params$odir, "/trvz_figures")))){
+  dir.create(file.path(paste0(params$odir, "/trvz_figures")))
+}
+if(!dir.exists(file.path(paste0(params$odir, "/trvz_logs")))){
+  dir.create(file.path(paste0(params$odir, "/trvz_logs")))
+}
+
+# Run trvz
+to_show_tab <- to_show_tab %>% 
+  mutate(toshow=1)
+anyfailed <- 0
+# If not significant repeat, skip this
+if(nrow(disease_sig_rep) != 0){
+  for (i in 1:nrow(disease_sig_rep)){
+    sample_name <- disease_sig_rep[i, ]$Sample
+    repeat_id <- disease_sig_rep[i, ]$Gene
+    sample_vcf <- sample_sheet %>% filter(sample == sample_name) %>% pull(vcf_path)
+    sample_bam <- sample_sheet %>% filter(sample == sample_name) %>% pull(bam_path)
+    trvz_command <- c("--genome", params$hg38, "--repeats", params$pathogenic_bed, "--vcf",
+                      sample_vcf, "--spanning-reads", sample_bam, "--repeat-id",
+                      repeat_id, "--image", paste0(params$odir, "/trvz_figures/", sample_name, ".", repeat_id, ".svg"))
+    p <- process$new(params$trvz_binary, trvz_command, 
+                     stdout = paste0(params$odir, "/trvz_logs/", sample_name, ".", repeat_id, ".trvz.stdout"),
+                     stderr = paste0(params$odir, "/trvz_logs/", sample_name, ".", repeat_id, ".trvz.stderr"))
+    p$wait()
+    if (p$get_exit_status() != 0){
+      cat('\n')
+      cat(paste0("trvz failed for ", sample_name, ".", repeat_id, "\n"))
+      # If any trvz figures failed generating, do not show that sample in the subsequent figures
+      to_show_tab[to_show_tab$Sample == sample_name, ]$toshow <- 0
+      anyfailed <- 1
+    }
+  }
+  if(anyfailed == 1){
+    cat('\n')
+    cat("Report will not contain trvz visualization for these repeats. Check the folder trvz_logs for more details.\n") 
+  }
+  
+  to_vis_trvz <- to_show_tab %>% 
+    filter(`Pathogenic motif high?` == "Yes",
+           toshow == 1)
+  # If all trvz failed, don't run this!
+  if(nrow(to_vis_trvz) != 0){
+    for (i in 1:nrow(to_vis_trvz)){
+      samp_to_vis <- to_vis_trvz[i,]$Sample
+      trid_to_vis <- to_vis_trvz[i,]$TRID
+      pandoc.header(paste0(samp_to_vis, ": ", trid_to_vis), level = 2)
+      image_path <- paste0(params$odir, "/trvz_figures/", samp_to_vis, ".", trid_to_vis, ".svg")
+      cat('\n![', samp_to_vis, trid_to_vis,'](', image_path, ')\n')
+      cat('\n')
+    }
+  }
+} else {
+  cat('\n')
+  cat('No significant repeats found!')
+  cat('\n')
+}
+```
+
+<!-- https://stackoverflow.com/questions/56361986/zoom-function-in-rmarkdown-html-plot -->
+<!-- To allow plot zoom in -->
+```{css zoom-lib-src, echo = FALSE}
+script src = "https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js"
+```
+```{js zoom-jquery, echo = FALSE}
+$(document).ready(function() {
+$('body').prepend('<div class=\"zoomDiv\"><img src=\"\" class=\"zoomImg\"></div>');
+// onClick function for all plots (img's)
+$('img:not(.zoomImg)').click(function() {
+$('.zoomImg').attr('src', $(this).attr('src')).css({width: '100%'});
+$('.zoomDiv').css({opacity: '1', width: 'auto', border: '1px solid white', borderRadius: '5px', position: 'fixed', top: '50%', left: '50%', marginRight: '-50%', transform: 'translate(-50%, -50%)', boxShadow: '0px 0px 50px #888888', zIndex: '50', overflow: 'auto', maxHeight: '100%'});
+});
+// onClick function for zoomImg
+$('img.zoomImg').click(function() {
+$('.zoomDiv').css({opacity: '0', width: '0%'}); 
+});
+});
+```
+
+# Parameters
+```{r, echo=FALSE, results="asis"}
+for (i in 1:length(params)){
+  cat("* ", "`", names(params[i]), "`", ": ") 
+  cat("`", params[[i]], "`")
+  cat('\n') 
+}
+```
+
+<!-- # Documentation and TODO -->
+<!-- * TODO: RFC1 requires special handling? -->
+<!-- * TODO: Motif checking now only checks against a single known pathogenic repeat motif. -->
+<!--   Eventually if we want to check multiple motifs it should be straightforward to implement -->
+<!--   multiple motif check -->
+<!-- * TODO: On the distribution plot, the coloring is based on known pathogenic motif whereas -->
+<!--   the sample points are based on any motif. Need to resolve this discrepancy. -->
+<!-- * TODO: Novel motif discovery? -->
+<!-- * DONE: Remove stars for pathogenic -->
+<!-- * DONE: Colorblind safe color for the premutation -->
+<!-- * TODO: Perhaps make everything on left same color for normal -->
+<!-- * DONE: Document the logics used in filtering -->
