@@ -19,6 +19,9 @@ option_list = list(
   make_option(c("--hideGene"), type="character", default="NIPA1, TCF4", 
               help='(Optional) Genes to hide on the report table. Comma separated. Set input to "" if do not want to filter.
                    Default: %default', metavar="character"),
+  make_option(c("--knownOnly"), type="logical", default=TRUE, 
+              help='(Optional) Show only loci known to have pathogenic repeats. Default: TRUE.
+                   Default: %default', metavar="logical"),
   make_option(c("--output"), type="character", default="trgt_report", 
               help="(Optional) Output directory prefix. Specify $(pwd) before output dir if using Docker or Singularity.
                    Default: %default", metavar="character")
@@ -56,6 +59,7 @@ rmarkdown::render(paste0(opt$output, "/TRexs.Rmd"), params=list(sample_sheet=opt
                                                                  hg38=opt$reference, 
                                                                  repeats_db=opt$repeatDB, 
                                                                  high_prev_genes=opt$hideGene,
+                                                                 show_additional_gene=!opt$knownOnly,
                                                                  odir=opt$output),
                   output_dir = opt$output,
                   knit_root_dir = opt$output)

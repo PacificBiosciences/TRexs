@@ -16,7 +16,8 @@ params:
   repeats_db: ""
   high_prev_genes: ""
   show_high_prev_gene: FALSE
-  version: "0.3"
+  show_additional_gene: FALSE
+  version: "0.3.2"
   odir: "./"
 editor_options: 
   chunk_output_type: console
@@ -98,7 +99,11 @@ read_vcf <- function(ivcf){
                                    "FORMAT" = "c", "values" = "c"))
   vcf <- vcf %>% 
     separate(values, into=format_id, sep=":") %>% 
-    mutate(vcf_path = ivcf)
+    mutate(
+      # Use this if generating control csv
+      # sample = vcf_name,
+      vcf_path = ivcf
+    )
 }
 
 disease_repeats <- map_dfr(sample_sheet$vcf_path, read_vcf) %>% 
@@ -135,9 +140,23 @@ repeats_db <- read_tsv(params$repeats_db)
 
 merge_repeat <- bind_rows(disease_repeats,
                           control_repeats)
+
+
 # Split haplotype length
 merge_repeat <- merge_repeat %>% 
-  mutate(repeat_gene = gsub("TRID=(.*?);.*", "\\1", INFO)) %>% 
+  mutate(repeat_gene = gsub("TRID=(.*?);.*", "\\1", INFO))
+
+# Do we want to show additional genes not in control DB?
+control_repeats_genes <- merge_repeat %>% 
+  filter(sample_type == "control") %>% 
+  pull(repeat_gene)
+
+if(!params$show_additional_gene){
+  merge_repeat <- merge_repeat %>% 
+    filter(repeat_gene %in% control_repeats_genes)
+}
+
+merge_repeat <- merge_repeat %>%
   separate(AL, into=c("AL1", "AL2"), sep = ",") %>% 
   separate(SD, into=c("SD1", "SD2"), sep = ",") %>% 
   mutate_at(c("AL1", "AL2",
@@ -186,9 +205,7 @@ merge_repeat <- merge_repeat %>%
 # Get all genotyped genes (for sanity check)
 genotyped <- unique(merge_repeat$repeat_gene)
 
-control_repeats_genes <- merge_repeat %>% 
-  filter(sample_type == "control") %>% 
-  pull(repeat_gene) %>% table
+control_repeats_genes <- table(control_repeats_genes)
 disease_repeats_genes <- merge_repeat %>% 
   filter(sample_type == "disease") %>% 
   pull(repeat_gene) %>% table 
@@ -223,7 +240,7 @@ repeats_db[repeats_db$repeat_gene == "SOX3", 'pathogenic threshold'] <- 47
 
 # Add annotation to main df
 annotate_rep <- merge_repeat %>% 
-  inner_join(repeats_db, by="repeat_gene")
+  left_join(repeats_db, by="repeat_gene")
 
 repeats_db <- repeats_db %>% 
   mutate(sample_type = 'pathogenic threshold')
@@ -237,6 +254,7 @@ all_genes <- annotate_rep %>%
 # Order genes
 merge_repeat$repeat_gene <- factor(merge_repeat$repeat_gene, levels=all_genes)
 repeats_db$repeat_gene <- factor(repeats_db$repeat_gene, levels=all_genes)
+annotate_rep$repeat_gene <- factor(annotate_rep$repeat_gene, levels = all_genes)
 
 all_genes <- split(all_genes, cut(seq_along(all_genes), 4, labels = FALSE))
 ```
@@ -256,8 +274,10 @@ all_genes <- split(all_genes, cut(seq_along(all_genes), 4, labels = FALSE))
 * Note that number of copies here are sum of all expanded motifs and are not specific to motifs known to cause disease.
 * By default, normal, premutation and pathogenic thresholds are curated using the `DRED` database as a base. Developer may manually curate and modify the threshold to the best of his/her knowledge.
 * Transparency of the points for diseased cohort corresponds to the `isofor_score` which is
-the method used to detect outlier based on allelic length (regardless of motifs). The higher the score is,
+the isolation forest method used to detect outlier based on allelic length (regardless of motifs). The higher the score is,
 the rarer the sample's repeats expansion is.
+* There's a small quirk in which some repeats are related to multiple diseases (e.g. ARX and FMR1), and hence results in
+  duplicated points for these genes.
 
 ```{r annotate_repeat, echo=FALSE, message=FALSE, fig.height=16, fig.width=12, results="asis"}
 # Which one has repeat higher than pathogenic low?
@@ -293,8 +313,19 @@ for (i in 1:length(all_genes)){
     filter(repeat_gene %in% all_genes[[i]]) %>% 
     select(repeat_gene, contains("normal"), contains("premutation"), 
            contains("pathogenic"), -contains("r_"),
-           -`pathogenic threshold`, d_name) %>% 
-    arrange(repeat_gene)
+           -`pathogenic threshold`, d_name)
+  
+    # Append genes with no annotation
+  noannot <- all_genes[[i]][!all_genes[[i]] %in% repeats_seg$repeat_gene]
+  if(length(noannot > 0)){
+    empty_seg <- tibble(
+      repeat_gene = factor(noannot, levels = levels(annotate_rep$repeat_gene)),
+      miny = rep(0, length(noannot)),
+      w = rep(0, length(noannot)),
+    )
+    repeats_seg <- bind_rows(repeats_seg, empty_seg) %>% 
+      arrange(repeat_gene)
+  }
   
   # Give gene group number
   repeats_seg$x <- 1
@@ -472,6 +503,8 @@ htmltools::attachDependencies(x = htmltools::tagList(), value = unlist(deps,recu
 * This table is generated based on the following logics:
   * `MC` tags from `trgt` output is used to get total number of copies on each allele (e.g. "50_50" represent 50 copies for each motif genotyped, and this will sum to 100).
   * All samples are filtered if maximum number of copies expanded by any motif exceed known pathogenic threshold. This means, if there's 1000 copies of `TAAAA`, we will output this even though it's not the known pathogenic motifs.
+  * In addition, if the outlier score (isofor_score) is higher than 0.90, 
+    the repeat expansion is also considered as potentially significant.
   * For the remaining samples, we further filter based on known inheritance patterns. E.g. in `RFC1` both allele needs to be expanded more than the pathogenic threshold.
   * However, if known pathogenic motifs are found in sample, it's tested specifically for that motif to produce "Pathogenic motif high?". E.g. in `BEAN1` we test specifically if `TGGAA` has more copies than known threshold.
   * Finally, if we see >10% or n>=5 control samples have copies more than pathogenic threshold, we check if the disease samples are expanded more than the minimum copies in the group of control samples with high expansion, while considering inheritance pattern similar to above.
@@ -492,7 +525,11 @@ annotate_rep$`Pathogenic motif high?` <- rep("No", nrow(annotate_rep))
 for (i in 1:nrow(annotate_rep)){
   row <- annotate_rep[i, ]
   mc <- str_split_fixed(row$MC, ",", 2)
-  if(grepl(row$pathogenic_motifs, row$MOTIFS)){
+  # Test if motif matches
+  motif_match <- grepl(row$pathogenic_motifs, row$MOTIFS)
+  # For genes not in repeats DB, ignore and go on to the next loop
+  if(is.na(motif_match)) next
+  if(motif_match){
     motif_name <- c(str_split(row$MOTIFS, ",", simplify = TRUE))
     motif_copies1 <- suppressWarnings(as.numeric(str_split(mc[1], "_", simplify = TRUE)))
     motif_copies2 <- suppressWarnings(as.numeric(str_split(mc[2], "_", simplify = TRUE)))
@@ -521,8 +558,11 @@ for (i in 1:nrow(annotate_rep)){
   }
 }
 
+# Outlier score threshold for filtering
+outlier_threshold <- 0.85
+
 sig_rep <- annotate_rep %>% 
-  filter(max_copy > pathogenic_low) %>% 
+  filter(max_copy > pathogenic_low | isofor_score >= outlier_threshold) %>% 
   select(sample, sample_type, repeat_gene, max_copy, pathogenic_low, pathogenic_motifs,
          d_name, d_name_alias, d_inheritance, `Has pathogenic motif?`, `Pathogenic motif high?`,
          h1_nCopies, h2_nCopies, isofor_score, ALCI, SD1, SD2, MC, MS, AM, TRID, END, MOTIFS, STRUC) %>% 
@@ -621,7 +661,8 @@ to_show_tab %>%
 ```
 
 # TRVZ Visualization of Potentially Pathogenic Repeats {.tabset .tabset-dropdown}
-* By default, only those with matching pathogenic motifs ("Pathogenic Motif High" column above) will be visualized here.
+* By default, only those with matching pathogenic motifs ("Pathogenic Motif High" column above) or
+  has outlier score of more than 0.85 will be visualized here.
 ```{r trvz_rep_viz, echo=FALSE, out.width = "100%", fig.align = "center", results="asis", dpi=36}
 
 if(!dir.exists(file.path(paste0(params$odir, "/trvz_figures")))){
@@ -639,7 +680,7 @@ anyfailed <- 0
 if(nrow(disease_sig_rep) != 0){
   for (i in 1:nrow(disease_sig_rep)){
     sample_name <- disease_sig_rep[i, ]$Sample
-    repeat_id <- disease_sig_rep[i, ]$Gene
+    repeat_id <- as.character(disease_sig_rep[i, ]$Gene)
     sample_vcf <- sample_sheet %>% filter(sample == sample_name) %>% pull(vcf_path)
     sample_bam <- sample_sheet %>% filter(sample == sample_name) %>% pull(bam_path)
     trvz_command <- c("--genome", params$hg38, "--repeats", params$pathogenic_bed, "--vcf",
@@ -649,6 +690,8 @@ if(nrow(disease_sig_rep) != 0){
                      stdout = paste0(params$odir, "/trvz_logs/", sample_name, ".", repeat_id, ".trvz.stdout"),
                      stderr = paste0(params$odir, "/trvz_logs/", sample_name, ".", repeat_id, ".trvz.stderr"))
     p$wait()
+    write(trvz_command,
+          file = paste0(params$odir, "/trvz_logs/", sample_name, ".", repeat_id, ".trvz.stdout"))
     if (p$get_exit_status() != 0){
       cat('\n')
       cat(paste0("trvz failed for ", sample_name, ".", repeat_id, "\n"))
@@ -663,7 +706,7 @@ if(nrow(disease_sig_rep) != 0){
   }
   
   to_vis_trvz <- to_show_tab %>% 
-    filter(`Pathogenic motif high?` == "Yes",
+    filter(`Pathogenic motif high?` == "Yes" | `Outlier score` >= outlier_threshold,
            toshow == 1)
   # If all trvz failed, don't run this!
   if(nrow(to_vis_trvz) != 0){
