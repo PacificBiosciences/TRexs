@@ -6,7 +6,7 @@ option_list = list(
   make_option(c("-s", "--sample"), type="character", default=NULL, 
               help="(Required) Sample sheet TSV, 3 columns: sample, VCF and trgt sorted bam (in this order). TSV should not have a header",
               metavar="character"),
-  make_option(c("-c", "--control"), type="character", default="/app/control_samples_repeat_2022-10-20.tsv.gz", 
+  make_option(c("-c", "--control"), type="character", default="/app/control_samples_repeat_2023-4-10.tsv.gz", 
               help="(Required) Repeats TSV file for background control. This is provided as control_samples_repeat.tsv.gz on GitHub", metavar="character"),
   make_option(c("--trvz"), type="character", default="/app/trvz", 
               help="(Required) trvz binary location", metavar="character"),

@@ -29,6 +29,10 @@ provide a `Docker` image if your computer/server supports `Singularity` or `Dock
 docker run --rm kpinpb/trexs:latest TRexs --help
 
 # With Singularity
+# Note that if you bump into issues such as "rlang is already loaded",
+# you may have an Rprofile at your home directory. In that case, 
+# you may want to run singularity with the "--no-home" flag and mount
+# the relevant directory (e.g. reference directory) manually with "--bind"
 singularity exec docker://kpinpb/trexs:latest TRexs --help
 ```
 
@@ -166,6 +170,12 @@ In the output directory, you will find:
 
 ## Resource usage example
 On a cohort of 1000 samples/VCFs, the tool used 3.4GB RAM and 10 minutes on 4 CPUs.
+
+## Common issue
+* Installing `isotree` can fail due to GCC not linking `ft2build.h` properly. You
+  can symlink the `freetype` library (should be installed alongside the conda
+  environment) by doing `ln -s $conda_env_path/include/freetype2/* $conda_env_path/lib/R/include/` 
+  where `$conda_env_path` is the conda environment path.
 
 ## Support information
 TRexs is a pre-release software intended for research use only and not for use in diagnostic procedures. While efforts have been made to ensure that TRexs lives up to the quality that PacBio strives for, we make no warranty regarding this software.

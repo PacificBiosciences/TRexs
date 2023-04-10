@@ -17,7 +17,7 @@ params:
   high_prev_genes: ""
   show_high_prev_gene: FALSE
   show_additional_gene: FALSE
-  version: "0.3.2"
+  version: "0.4.0"
   odir: "./"
 editor_options: 
   chunk_output_type: console
@@ -54,7 +54,7 @@ theme_set(theme_bw(base_size = 14))
 # Load all VCFs
 # all_vcf <- dir(params$disease_folder, "*.vcf.gz",
 #                full.names = TRUE)
-# control_vcf <- dir("control_vcf/", "*.vcf.gz",
+# control_vcf <- dir("control_vcf_v0.4/", "*.vcf.gz",
 #                    full.names = TRUE)
 
 # Load sample sheet
@@ -398,7 +398,7 @@ for (i in 1:length(all_genes)){
                                        "\nGenotyped motifs: ", MOTIFS,
                                        "\ntrgt MC: ", MC,
                                        "\nAllelic length: ", AL1, ", ", AL2,
-                                       "\nAllelic confidence interval: ", ALCI,
+                                       "\nAllelic confidence interval: ", ALLR,
                                        "\nAllelic depth: ", SD1, ", ", SD2)),
                      alpha = 0.35,
                      stroke = NA) +
@@ -412,7 +412,7 @@ for (i in 1:length(all_genes)){
                                               "\nGenotyped motifs: ", MOTIFS,
                                               "\ntrgt MC: ", MC,
                                               "\nAllelic length: ", AL1, ", ", AL2, 
-                                              "\nAllelic confidence interval: ", ALCI,
+                                              "\nAllelic confidence interval: ", ALLR,
                                               "\nAllelic depth: ", SD1, ", ", SD2)),
                          alpha = isofor_score),
                      stroke = NA) +
@@ -565,7 +565,7 @@ sig_rep <- annotate_rep %>%
   filter(max_copy > pathogenic_low | isofor_score >= outlier_threshold) %>% 
   select(sample, sample_type, repeat_gene, max_copy, pathogenic_low, pathogenic_motifs,
          d_name, d_name_alias, d_inheritance, `Has pathogenic motif?`, `Pathogenic motif high?`,
-         h1_nCopies, h2_nCopies, isofor_score, ALCI, SD1, SD2, MC, MS, AM, TRID, END, MOTIFS, STRUC) %>% 
+         h1_nCopies, h2_nCopies, isofor_score, ALLR, SD1, SD2, MC, MS, AM, TRID, END, MOTIFS, STRUC) %>% 
   # If autosomal recessive disease, require both HL to be longer
   mutate(keep = if_else(grepl("recessive", d_inheritance) & (!grepl("dominant", d_inheritance)), 
                         if_else(h1_nCopies > pathogenic_low & h2_nCopies > pathogenic_low, "Yes", "No"),
